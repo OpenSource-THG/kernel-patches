@@ -1,0 +1,150 @@
+From f10c0a1b0032c9d95c1c33a1cdadbd22b2378df1 Mon Sep 17 00:00:00 2001
+From: Alasdair McWilliam <alasdair.mcwilliam@outlook.com>
+Date: Fri, 1 Nov 2024 12:02:26 +0000
+Subject: [PATCH] Revert "ice: remove af_xdp_zc_qps bitmap"
+
+This reverts commit adbf5a42341f6ea038d3626cd4437d9f0ad0b2dd while taking into account commit ebc33a3f8d0aeddf19fd5827add24b82ae171829 ("ice: improve updating ice_{t,r}x_ring::xsk_pool").
+---
+ drivers/net/ethernet/intel/ice/ice.h     | 36 ++++++++----------------
+ drivers/net/ethernet/intel/ice/ice_lib.c |  8 ++++++
+ drivers/net/ethernet/intel/ice/ice_xsk.c | 13 +++++----
+ 3 files changed, 27 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index d6f80da30dec..1f194d3c63be 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -410,6 +410,7 @@ struct ice_vsi {
+ 	struct ice_tc_cfg tc_cfg;
+ 	struct bpf_prog *xdp_prog;
+ 	struct ice_tx_ring **xdp_rings;	 /* XDP ring array */
++	unsigned long *af_xdp_zc_qps;	 /* tracks AF_XDP ZC enabled qps */
+ 	u16 num_xdp_txq;		 /* Used XDP queues */
+ 	u8 xdp_mapping_mode;		 /* ICE_MAP_MODE_[CONTIG|SCATTER] */
+ 	struct mutex xdp_state_lock;
+@@ -756,26 +757,7 @@ static inline void ice_set_ring_xdp(struct ice_tx_ring *ring)
+ }
+ 
+ /**
+- * ice_get_xp_from_qid - get ZC XSK buffer pool bound to a queue ID
+- * @vsi: pointer to VSI
+- * @qid: index of a queue to look at XSK buff pool presence
+- *
+- * Return: A pointer to xsk_buff_pool structure if there is a buffer pool
+- * attached and configured as zero-copy, NULL otherwise.
+- */
+-static inline struct xsk_buff_pool *ice_get_xp_from_qid(struct ice_vsi *vsi,
+-							u16 qid)
+-{
+-	struct xsk_buff_pool *pool = xsk_get_pool_from_qid(vsi->netdev, qid);
+-
+-	if (!ice_is_xdp_ena_vsi(vsi))
+-		return NULL;
+-
+-	return (pool && pool->dev) ? pool : NULL;
+-}
+-
+-/**
+- * ice_rx_xsk_pool - assign XSK buff pool to Rx ring
++ * ice_rx_xsk_pool - assign XSK buff pool bound to a ring
+  * @ring: Rx ring to use
+  *
+  * Sets XSK buff pool pointer on Rx ring.
+@@ -784,8 +766,11 @@ static inline void ice_rx_xsk_pool(struct ice_rx_ring *ring)
+ {
+ 	struct ice_vsi *vsi = ring->vsi;
+ 	u16 qid = ring->q_index;
+-
+-	WRITE_ONCE(ring->xsk_pool, ice_get_xp_from_qid(vsi, qid));
++	
++	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps))
++		WRITE_ONCE(ring->xsk_pool, NULL);
++	else
++		WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid));
+ }
+ 
+ /**
+@@ -809,8 +794,11 @@ static inline void ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
+ 	ring = vsi->rx_rings[qid]->xdp_ring;
+ 	if (!ring)
+ 		return;
+-
+-	WRITE_ONCE(ring->xsk_pool, ice_get_xp_from_qid(vsi, qid));
++	
++	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps)) {
++		WRITE_ONCE(ring->xsk_pool, NULL);
++	else
++		WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 06e712cdc3d9..da23e454470c 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -117,8 +117,14 @@ static int ice_vsi_alloc_arrays(struct ice_vsi *vsi)
+ 	if (!vsi->q_vectors)
+ 		goto err_vectors;
+ 
++	vsi->af_xdp_zc_qps = bitmap_zalloc(max_t(int, vsi->alloc_txq, vsi->alloc_rxq), GFP_KERNEL);
++	if (!vsi->af_xdp_zc_qps)
++		goto err_zc_qps;
++
+ 	return 0;
+ 
++err_zc_qps:
++	devm_kfree(dev, vsi->q_vectors);
+ err_vectors:
+ 	devm_kfree(dev, vsi->rxq_map);
+ err_rxq_map:
+@@ -313,6 +319,8 @@ static void ice_vsi_free_arrays(struct ice_vsi *vsi)
+ 
+ 	dev = ice_pf_to_dev(pf);
+ 
++	bitmap_free(vsi->af_xdp_zc_qps);
++	vsi->af_xdp_zc_qps = NULL;
+ 	/* free the ring and vector containers */
+ 	devm_kfree(dev, vsi->q_vectors);
+ 	vsi->q_vectors = NULL;
+diff --git a/drivers/net/ethernet/intel/ice/ice_xsk.c b/drivers/net/ethernet/intel/ice/ice_xsk.c
+index 334ae945d640..c2a181f91d20 100644
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@ -271,6 +271,7 @@ static int ice_xsk_pool_disable(struct ice_vsi *vsi, u16 qid)
+ 	if (!pool)
+ 		return -EINVAL;
+ 
++	clear_bit(qid, vsi->af_xdp_zc_qps);
+ 	xsk_pool_dma_unmap(pool, ICE_RX_DMA_ATTR);
+ 
+ 	return 0;
+@@ -301,6 +302,8 @@ ice_xsk_pool_enable(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
+ 	if (err)
+ 		return err;
+ 
++	set_bit(qid, vsi->af_xdp_zc_qps);
++
+ 	return 0;
+ }
+ 
+@@ -348,13 +351,11 @@ ice_realloc_rx_xdp_bufs(struct ice_rx_ring *rx_ring, bool pool_present)
+ int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc)
+ {
+ 	struct ice_rx_ring *rx_ring;
+-	uint i;
+-
+-	ice_for_each_rxq(vsi, i) {
+-		rx_ring = vsi->rx_rings[i];
+-		if (!rx_ring->xsk_pool)
+-			continue;
++	unsigned long q;
+ 
++	for_each_set_bit(q, vsi->af_xdp_zc_qps,
++			 max_t(int, vsi->alloc_txq, vsi->alloc_rxq)) {
++		rx_ring = vsi->rx_rings[q];
+ 		if (ice_realloc_rx_xdp_bufs(rx_ring, zc))
+ 			return -ENOMEM;
+ 	}
+-- 
+2.43.5
+
